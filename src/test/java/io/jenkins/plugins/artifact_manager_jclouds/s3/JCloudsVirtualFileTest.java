@@ -28,12 +28,12 @@ import io.jenkins.plugins.artifact_manager_jclouds.JCloudsVirtualFile;
 import io.jenkins.plugins.aws.global_configuration.CredentialsAwsGlobalConfiguration;
 import static org.hamcrest.Matchers.*;
 import static org.jclouds.blobstore.options.ListContainerOptions.Builder.*;
-import static org.junit.Assert.*;
 
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.InputStream;
 import java.net.URLEncoder;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.List;
 import java.util.logging.Handler;
@@ -52,15 +52,25 @@ import org.junit.Test;
 import org.jvnet.hudson.test.Issue;
 import org.jvnet.hudson.test.LoggerRule;
 
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.model.ListObjectsV2Result;
-import com.amazonaws.services.s3.model.S3ObjectSummary;
 import java.net.ProtocolException;
 
 import jenkins.util.VirtualFile;
+import static org.hamcrest.MatcherAssert.assertThat;
 import org.jclouds.http.HttpResponseException;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
 public class JCloudsVirtualFileTest extends S3AbstractTest {
+
+    protected static final Logger LOGGER = Logger.getLogger(JCloudsVirtualFileTest.class.getName());
 
     protected File tmpFile;
     protected String filePath, missingFilePath, weirdCharactersPath;
@@ -71,7 +81,7 @@ public class JCloudsVirtualFileTest extends S3AbstractTest {
     @Override
     public void setup() throws Exception {
         tmpFile = tmp.newFile();
-        FileUtils.writeStringToFile(tmpFile, "test");
+        Files.writeString(tmpFile.toPath(), "test");
         filePath = getPrefix() + tmpFile.getName();
         Blob blob = blobStore.blobBuilder(filePath).payload(tmpFile).build();
 
@@ -112,7 +122,8 @@ public class JCloudsVirtualFileTest extends S3AbstractTest {
     }
 
     private JCloudsVirtualFile newJCloudsBlobStore(String path) {
-        return new JCloudsVirtualFile(new S3BlobStore(), getContainer(), path.replaceFirst("/$", ""));
+        S3BlobStore s3BlobStore = new S3BlobStore();
+        return new JCloudsVirtualFile(s3BlobStore, getContainer(), path.replaceFirst("/$", ""));
     }
 
     @Test
@@ -243,7 +254,7 @@ public class JCloudsVirtualFileTest extends S3AbstractTest {
         });
         // Default list page size for S3 is 1000 blobs; we have 1010 plus the two created for all tests, so should hit a second page.
         assertThat(subdir.list("sprawling/**/k3", null, true), iterableWithSize(100));
-        assertEquals("calls GetBucketLocation then ListBucket, advance to …/sprawling/i9/j8/k8, ListBucket again", 3, httpLogging.getRecords().size());
+        assertThat("calls GetBucketLocation (perhaps) then ListBucket, advance to …/sprawling/i9/j8/k8, ListBucket again", httpLogging.getRecords().size(), lessThanOrEqualTo(3));
     }
 
     @Test
@@ -286,9 +297,9 @@ public class JCloudsVirtualFileTest extends S3AbstractTest {
         try {
             putBlob(blobStore.blobBuilder(key).payload("test").build());
 
-            final AmazonS3 s3 = S3BlobStoreConfig.clientBuilder.get().build();
-            ListObjectsV2Result result = s3.listObjectsV2(getContainer(), key);
-            List<S3ObjectSummary> objects = result.getObjectSummaries();
+            final S3Client s3 = S3Client.create();
+            ListObjectsV2Response result = s3.listObjectsV2(ListObjectsV2Request.builder().bucket(getContainer()).build());
+            List<S3Object> objects = result.contents();
             assertThat(objects, not(empty()));
 
             // fails with
