@@ -25,23 +25,19 @@
 package io.jenkins.plugins.artifact_manager_jclouds.s3;
 
 import java.io.IOException;
-import java.util.function.Supplier;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
+import jenkins.util.SystemProperties;
 import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.interceptor.RequirePOST;
 
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.client.builder.AwsClientBuilder;
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.AmazonS3ClientBuilder;
-import com.amazonaws.services.s3.model.Bucket;
 import com.google.common.annotations.VisibleForTesting;
-import com.amazonaws.services.s3.model.BucketAccelerateConfiguration;
-import com.amazonaws.services.s3.model.BucketAccelerateStatus;
-import com.amazonaws.services.s3.model.SetBucketAccelerateConfigurationRequest;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
@@ -59,7 +55,18 @@ import io.jenkins.plugins.aws.global_configuration.CredentialsAwsGlobalConfigura
 import jenkins.model.Jenkins;
 import jenkins.security.FIPS140;
 import org.jenkinsci.Symbol;
-
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.SdkSystemSetting;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.regions.providers.DefaultAwsRegionProviderChain;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3ClientBuilder;
+import software.amazon.awssdk.services.s3.model.Bucket;
+import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
+import software.amazon.awssdk.services.s3.model.CreateBucketResponse;
+import software.amazon.awssdk.services.s3.model.GetBucketLocationRequest;
 
 /**
  * Store the S3BlobStore configuration to save it on a separate file. This make that
@@ -69,6 +76,8 @@ import org.jenkinsci.Symbol;
 @Symbol("s3")
 @Extension
 public final class S3BlobStoreConfig extends AbstractAwsGlobalConfiguration {
+
+    private static final Logger LOGGER = Logger.getLogger(S3BlobStoreConfig.class.getName());
 
     private static final String BUCKET_REGEXP = "^([a-z]|(\\d(?!\\d{0,2}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})))([a-z\\d]|(\\.(?!(\\.|-)))|(-(?!\\.))){1,61}[a-z\\d\\.]$";
     private static final Pattern bucketPattern = Pattern.compile(BUCKET_REGEXP);
@@ -80,6 +89,11 @@ public final class S3BlobStoreConfig extends AbstractAwsGlobalConfiguration {
     private static boolean DELETE_ARTIFACTS = Boolean.getBoolean(S3BlobStoreConfig.class.getName() + ".deleteArtifacts");
     @SuppressWarnings("FieldMayBeFinal")
     private static boolean DELETE_STASHES = Boolean.getBoolean(S3BlobStoreConfig.class.getName() + ".deleteStashes");
+
+    static {
+        String timeout = SystemProperties.getString(S3BlobStoreConfig.class.getName() + "." + SdkSystemSetting.AWS_METADATA_SERVICE_TIMEOUT.property(), "10");
+        System.setProperty(SdkSystemSetting.AWS_METADATA_SERVICE_TIMEOUT.property(), timeout);
+    }
 
     /**
      * Name of the S3 Bucket.
@@ -161,13 +175,14 @@ public final class S3BlobStoreConfig extends AbstractAwsGlobalConfiguration {
         save();
     }
 
+    @CheckForNull
     public String getPrefix() {
         return prefix;
     }
 
     @DataBoundSetter
     public void setPrefix(String prefix){
-        this.prefix = prefix;
+        this.prefix = Util.fixEmptyAndTrim(prefix);
         checkValue(doCheckPrefix(prefix));
         save();
     }
@@ -273,52 +288,74 @@ public final class S3BlobStoreConfig extends AbstractAwsGlobalConfiguration {
         return ExtensionList.lookupSingleton(S3BlobStoreConfig.class);
     }
 
-    @VisibleForTesting
-    static Supplier<AmazonS3ClientBuilder> clientBuilder = AmazonS3ClientBuilder::standard;
-
     /**
     *
     * @return an AmazonS3ClientBuilder using the region or not, it depends if a region is configured or not.
     */
-    AmazonS3ClientBuilder getAmazonS3ClientBuilder() {
-        AmazonS3ClientBuilder ret = clientBuilder.get();
+    S3ClientBuilder getAmazonS3ClientBuilder() throws URISyntaxException {
+        S3ClientBuilder ret = S3Client.builder();
 
-        if (StringUtils.isNotBlank(customEndpoint)) {
+        if (StringUtils.isNotBlank(getResolvedCustomEndpoint())) {
             String resolvedCustomSigningRegion = customSigningRegion;
             if (StringUtils.isBlank(resolvedCustomSigningRegion)) {
-                resolvedCustomSigningRegion = "us-east-1";
+                // we must revert to a region if no custom defined
+                resolvedCustomSigningRegion = getRegion().id();
             }
-            ret = ret.withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(getResolvedCustomEndpoint(), resolvedCustomSigningRegion));
-        } else if (StringUtils.isNotBlank(CredentialsAwsGlobalConfiguration.get().getRegion())) {
-            ret = ret.withRegion(CredentialsAwsGlobalConfiguration.get().getRegion());
+            ret = ret.endpointOverride(new URI(getResolvedCustomEndpoint())).region(Region.of(resolvedCustomSigningRegion));
         } else {
-            ret = ret.withForceGlobalBucketAccessEnabled(true);
+            // not really sure of why this was used.. this should have a dedicated parameter
+            //ret = ret.useArnRegion(true);
+            // use same default algorithm as signer
+            ret = ret.region(getRegion());
         }
-        ret = ret.withAccelerateModeEnabled(useTransferAcceleration);
+        ret = ret.accelerate(useTransferAcceleration);
 
         // TODO the client would automatically use path-style URLs under certain conditions; is it really necessary to override?
-        ret = ret.withPathStyleAccessEnabled(getUsePathStyleUrl());
+        ret = ret.forcePathStyle(getUsePathStyleUrl());
 
         return ret;
     }
 
     @VisibleForTesting
-    public AmazonS3ClientBuilder getAmazonS3ClientBuilderWithCredentials() throws IOException {
-        return getAmazonS3ClientBuilderWithCredentials(getDisableSessionToken());
+    public S3ClientBuilder getAmazonS3ClientBuilderWithCredentials() throws IOException {
+        try {
+            return getAmazonS3ClientBuilderWithCredentials(getDisableSessionToken());
+        } catch (URISyntaxException e) {
+            throw new RuntimeException(e);
+        }
     }
 
-    private AmazonS3ClientBuilder getAmazonS3ClientBuilderWithCredentials(boolean disableSessionToken) throws IOException {
-        AmazonS3ClientBuilder builder = getAmazonS3ClientBuilder();
-        if (disableSessionToken) {
-            builder = builder.withCredentials(CredentialsAwsGlobalConfiguration.get().getCredentials());
-        } else {
-            AWSStaticCredentialsProvider credentialsProvider = new AWSStaticCredentialsProvider(
-            CredentialsAwsGlobalConfiguration.get().sessionCredentials(builder));
-            builder = builder.withCredentials(credentialsProvider);
+    public Region getRegion() {
+        String regionStr = CredentialsAwsGlobalConfiguration.get().getRegion();
+        if (regionStr == null) {
+            try {
+                return new DefaultAwsRegionProviderChain().getRegion();
+            } catch (SdkClientException e) {
+                // need to revert to a default one.
+                LOGGER.warning("There is no region configured for this S3 bucket and aws sdk couldn't discover one so using default: " + Region.US_EAST_1);
+                return Region.US_EAST_1;
+            }
         }
+        return Region.of(regionStr);
+    }
+
+    private S3ClientBuilder getAmazonS3ClientBuilderWithCredentials(boolean disableSessionToken) throws IOException, URISyntaxException {
+        S3ClientBuilder builder = getAmazonS3ClientBuilder();
+        if (disableSessionToken) {
+            builder = builder.credentialsProvider(CredentialsAwsGlobalConfiguration.get().getCredentials());
+        } else {
+            AwsSessionCredentials awsSessionCredentials = CredentialsAwsGlobalConfiguration.get()
+                    .sessionCredentials(getRegion().id(), CredentialsAwsGlobalConfiguration.get().getCredentialsId());
+            if(awsSessionCredentials != null ) {
+                builder.credentialsProvider(StaticCredentialsProvider.create(awsSessionCredentials));
+            } else {
+                throw new IOException("No session AWS credentials found");
+            }
+        }
+        builder = builder.region(getRegion());
         return builder;
     }
-    
+
     public FormValidation doCheckContainer(@QueryParameter String container){
         FormValidation ret = FormValidation.ok();
         if (StringUtils.isBlank(container)){
@@ -375,19 +412,25 @@ public final class S3BlobStoreConfig extends AbstractAwsGlobalConfiguration {
      * runtime exceptions are thrown by createBucket method.
      */
     public Bucket createS3Bucket(String name) throws IOException {
-        return createS3Bucket(name, getDisableSessionToken());
+        try {
+            return createS3Bucket(name, getDisableSessionToken());
+        } catch (URISyntaxException e) {
+            throw new IOException(e);
+        }
     }
 
-    private Bucket createS3Bucket(String name, boolean disableSessionToken) throws IOException {
-        AmazonS3ClientBuilder builder = getAmazonS3ClientBuilderWithCredentials(disableSessionToken);
+    private Bucket createS3Bucket(String name, boolean disableSessionToken) throws IOException, URISyntaxException {
+        S3ClientBuilder builder = getAmazonS3ClientBuilderWithCredentials(disableSessionToken);
         //Accelerated mode must be off in order to apply it to a bucket
-        AmazonS3 client = builder.withAccelerateModeEnabled(false).build();
-        Bucket bucket = client.createBucket(name);
-        if(useTransferAcceleration) {
-            client.setBucketAccelerateConfiguration(new SetBucketAccelerateConfigurationRequest(name,
-                new BucketAccelerateConfiguration(BucketAccelerateStatus.Enabled)));
+        try (S3Client client = builder.accelerate(false).build()) {
+            CreateBucketResponse response = client.createBucket(CreateBucketRequest.builder().bucket(name).build());
+            if(response.sdkHttpResponse().isSuccessful()) {
+                return Bucket.builder().name(name).build();
+            } else {
+                throw new IOException("Cannot create bucket with name:" + name
+                        + " response status : " + response.sdkHttpResponse().statusCode());
+            }
         }
-        return bucket;
     }
 
     @RequirePOST
@@ -403,10 +446,11 @@ public final class S3BlobStoreConfig extends AbstractAwsGlobalConfiguration {
         return ret;
     }
 
-    void checkGetBucketLocation(String container, boolean disableSessionToken) throws IOException {
-        AmazonS3ClientBuilder builder = getAmazonS3ClientBuilderWithCredentials(disableSessionToken);
-        AmazonS3 client = builder.build();
-        client.getBucketLocation(container);
+    void checkGetBucketLocation(String container, boolean disableSessionToken) throws IOException, URISyntaxException {
+        S3ClientBuilder builder = getAmazonS3ClientBuilderWithCredentials(disableSessionToken);
+        try (S3Client client = builder.build()) {
+            client.getBucketLocation(GetBucketLocationRequest.builder().bucket(container).build());
+        }
     }
 
     @RequirePOST
